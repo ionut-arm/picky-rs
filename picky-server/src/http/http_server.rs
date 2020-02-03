@@ -1,6 +1,7 @@
 use crate::{config::Config, http::controller::ServerController};
 use log4rs::Handle;
-use saphir::{router::Builder, Server as SaphirServer};
+use saphir::server::Server as SaphirServer;
+use tokio::runtime::Runtime;
 
 pub struct HttpServer {
     pub server: SaphirServer,
@@ -14,16 +15,21 @@ impl HttpServer {
         };
 
         let server = SaphirServer::builder()
-            .configure_router(|router: Builder| router.add(controller))
-            .configure_listener(|listener_config| listener_config.set_uri("http://0.0.0.0:12345"))
+            .configure_router(|r| r.controller(controller))
+            .configure_listener(|l| l.interface("0.0.0.0:12345"))
             .build();
 
         HttpServer { server }
     }
 
-    pub fn run(&self) {
-        if let Err(e) = self.server.run() {
-            log::error!("{}", e);
-        }
+    pub fn run(self) {
+        // Create the runtime
+        let mut rt = Runtime::new().expect("create tokio Runtime");
+
+        rt.block_on(async {
+            if let Err(e) = self.server.run().await {
+                log::error!("{:?}", e);
+            }
+        });
     }
 }
