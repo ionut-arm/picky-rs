@@ -82,7 +82,7 @@ async fn health(controller_data: &ServerController, _: Request<Body>) -> Result<
 
 async fn post_cert(controller_data: &ServerController, req: Request<Body>) -> Result<StatusCode, StatusCode> {
     let req = req
-        .map_async(|b| async { saphir::hyper::body::to_bytes(b).await })
+        .async_map(|b| async { saphir::hyper::body::to_bytes(b).await })
         .await
         .transpose()
         .bad_request()?;
@@ -163,7 +163,7 @@ async fn cert_signature_request(
         };
 
     let req = req
-        .map_async(|b| async { saphir::hyper::body::to_bytes(b).await })
+        .async_map(|b| async { saphir::hyper::body::to_bytes(b).await })
         .await
         .transpose()
         .bad_request()?;
