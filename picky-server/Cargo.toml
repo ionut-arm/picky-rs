@@ -32,9 +32,11 @@ snafu = "0.6"
 unicase = "2.6"
 rand = { version = "0.7", optional = true }
 tokio = "0.2"
+futures = "0.3"
 
 [dev-dependencies]
 rand = "0.7"
+tokio-test = "0.2"
 
 [features]
 pre-gen-pk = ["rand"]

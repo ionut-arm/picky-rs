@@ -15,19 +15,17 @@ use picky::{
     pem::{parse_pem, to_pem, Pem},
     x509::{Cert, Csr},
 };
-use saphir::prelude::body::Bytes;
 use saphir::{
     controller::{Controller, ControllerEndpoint, EndpointsBuilder},
     http::{Method, StatusCode},
     hyper::Body,
+    prelude::body::Bytes,
     request::Request,
     response::Builder as ResponseBuilder,
 };
 use serde_json::{self, Value};
-use std::{
-    borrow::Cow,
-    sync::{RwLock, RwLockReadGuard, RwLockWriteGuard},
-};
+use std::borrow::Cow;
+use tokio::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 pub struct ServerController {
     storage: BoxedPickyStorage,
@@ -36,11 +34,9 @@ pub struct ServerController {
 }
 
 impl ServerController {
-    pub fn new(config: Config, log_handle: Handle) -> Result<Self, String> {
-        let storage = get_storage(&config);
-
-        init_storage_from_config(storage.as_ref(), &config)?;
-
+    pub async fn new(config: Config, log_handle: Handle) -> Result<Self, String> {
+        let storage = get_storage(&config).await;
+        init_storage_from_config(storage.as_ref(), &config).await?;
         Ok(Self {
             storage,
             config: RwLock::new(config),
@@ -48,12 +44,12 @@ impl ServerController {
         })
     }
 
-    fn read_conf(&self) -> RwLockReadGuard<Config> {
-        self.config.read().expect("config lock") // if this fail, we're basically screwed
+    async fn read_conf(&self) -> RwLockReadGuard<'_, Config> {
+        self.config.read().await
     }
 
-    fn write_conf(&self) -> RwLockWriteGuard<Config> {
-        self.config.write().expect("config lock") // if this fail, we're basically screwed
+    async fn write_conf(&self) -> RwLockWriteGuard<'_, Config> {
+        self.config.write().await
     }
 }
 
@@ -78,7 +74,7 @@ impl Controller for ServerController {
 // === health === //
 
 async fn health(controller_data: &ServerController, _: Request<Body>) -> Result<&'static str, StatusCode> {
-    controller_data.storage.health().service_unavailable()?;
+    controller_data.storage.health().await.service_unavailable()?;
     Ok("I'm alive!")
 }
 
@@ -99,7 +95,7 @@ async fn post_cert(controller_data: &ServerController, req: Request<Body>) -> Re
         .bad_request_desc("couldn't find issuer common name")?
         .to_string();
 
-    if issuer_name != format!("{} Authority", &controller_data.read_conf().realm) {
+    if issuer_name != format!("{} Authority", &controller_data.read_conf().await.realm) {
         log::error!("this certificate was not signed by the CA of this server.");
         return Err(StatusCode::UNAUTHORIZED);
     }
@@ -110,12 +106,16 @@ async fn post_cert(controller_data: &ServerController, req: Request<Body>) -> Re
         .bad_request_desc("couldn't find subject issuer common name")?
         .to_string();
 
-    if let Err(e) = controller_data.storage.store(CertificateEntry {
-        name: subject_name.clone(),
-        cert: der,
-        key_identifier: ski,
-        key: None,
-    }) {
+    if let Err(e) = controller_data
+        .storage
+        .store(CertificateEntry {
+            name: subject_name.clone(),
+            cert: der,
+            key_identifier: ski,
+            key: None,
+        })
+        .await
+    {
         log::error!("insertion failed for leaf {}: {}", subject_name, e);
         return Err(StatusCode::INTERNAL_SERVER_ERROR);
     }
@@ -154,7 +154,7 @@ async fn cert_signature_request(
     req: Request<Body>,
 ) -> Result<ResponseBuilder, StatusCode> {
     let locked_subject_name: Option<String> =
-        match check_authorization(&controller_data.read_conf(), &req).unauthorized()? {
+        match check_authorization(&*controller_data.read_conf().await, &req).unauthorized()? {
             Authorized::ApiKey => None,
             Authorized::Token(token) => {
                 let csr_claims: CsrClaims = serde_json::from_value(token.into_claims()).bad_request()?;
@@ -188,14 +188,11 @@ async fn cert_signature_request(
     }
 
     // Sign CSR
-    let conf = controller_data.read_conf();
-    let signed_cert = sign_certificate(
-        &format!("{} Authority", &conf.realm),
-        csr,
-        &conf,
-        controller_data.storage.as_ref(),
-    )
-    .internal_error()?;
+    let conf = controller_data.read_conf().await;
+    let ca_name = format!("{} Authority", &conf.realm);
+    let signed_cert = sign_certificate(&ca_name, csr, &conf, controller_data.storage.as_ref())
+        .await
+        .internal_error()?;
     drop(conf); // release lock early
 
     match Format::response_format(&req).unwrap_or(Format::PemFile) {
@@ -248,18 +245,26 @@ async fn extract_csr_from_request(req: &Request<Bytes>) -> Result<Csr, GreedyErr
     }
 }
 
-fn sign_certificate(ca_name: &str, csr: Csr, config: &Config, storage: &dyn PickyStorage) -> Result<Cert, String> {
+async fn sign_certificate(
+    ca_name: &str,
+    csr: Csr,
+    config: &Config,
+    storage: &dyn PickyStorage,
+) -> Result<Cert, String> {
     let ca_hash = storage
         .get_addressing_hash_by_name(ca_name)
+        .await
         .map_err(|e| format!("couldn't fetch CA: {}", e))?;
 
     let ca_cert_der = storage
         .get_cert_by_addressing_hash(&ca_hash)
+        .await
         .map_err(|e| format!("couldn't get CA cert der: {}", e))?;
     let ca_cert = Cert::from_der(&ca_cert_der).map_err(|e| format!("couldn't deserialize CA cert: {}", e))?;
 
     let ca_pk_der = storage
         .get_key_by_addressing_hash(&ca_hash)
+        .await
         .map_err(|e| format!("couldn't fetch CA private key: {}", e))?;
     let ca_pk = Picky::parse_pk_from_magic_der(&ca_pk_der).map_err(|e| e.to_string())?;
 
@@ -289,6 +294,7 @@ fn sign_certificate(ca_name: &str, csr: Csr, config: &Config, storage: &dyn Pick
                 key_identifier: ski,
                 key: None,
             })
+            .await
             .map_err(|e| format!("insertion error for leaf {}: {}", dns_name, e))?;
     }
 
@@ -309,12 +315,17 @@ async fn get_cert(controller_data: &ServerController, req: Request<Body>) -> Res
         let converted = controller_data
             .storage
             .lookup_addressing_hash(&addressing_hash)
+            .await
             .internal_error_desc("address lookup failed")?;
         log::info!("converted cert address {} -> {}", addressing_hash_any_base, converted);
         converted
     };
 
-    let cert_der = match controller_data.storage.get_cert_by_addressing_hash(&canonical_address) {
+    let cert_der = match controller_data
+        .storage
+        .get_cert_by_addressing_hash(&canonical_address)
+        .await
+    {
         Ok(cert_der) => cert_der,
         Err(e) => {
             log::error!("couldn't fetch certificate using hash {}: {}", canonical_address, e);
@@ -322,11 +333,10 @@ async fn get_cert(controller_data: &ServerController, req: Request<Body>) -> Res
         }
     };
 
-    let res = ResponseBuilder::new();
     match Format::response_format(&req).unwrap_or(Format::PemFile) {
-        Format::PemFile => Ok(res.body(to_pem("CERTIFICATE", &cert_der))),
-        Format::PkixCertBinary => Ok(res.body(cert_der)),
-        Format::PkixCertBase64 => Ok(res.body(base64::encode(&cert_der))),
+        Format::PemFile => Ok(ResponseBuilder::new().body(to_pem("CERTIFICATE", &cert_der))),
+        Format::PkixCertBinary => Ok(ResponseBuilder::new().body(cert_der)),
+        Format::PkixCertBase64 => Ok(ResponseBuilder::new().body(base64::encode(&cert_der))),
         unexpected => {
             log::error!("unexpected response format: {}", unexpected);
             Err(StatusCode::BAD_REQUEST)
@@ -337,18 +347,20 @@ async fn get_cert(controller_data: &ServerController, req: Request<Body>) -> Res
 // === chain ===
 
 async fn get_default_chain(controller_data: &ServerController, _: Request<Body>) -> Result<String, StatusCode> {
-    let ca = format!("{} Authority", &controller_data.read_conf().realm);
-    let chain = find_ca_chain(controller_data.storage.as_ref(), &ca).not_found()?;
+    let ca = format!("{} Authority", &controller_data.read_conf().await.realm);
+    let chain = find_ca_chain(controller_data.storage.as_ref(), &ca).await.not_found()?;
     Ok(chain.join("\n"))
 }
 
-fn find_ca_chain(storage: &dyn PickyStorage, ca_name: &str) -> Result<Vec<String>, String> {
+async fn find_ca_chain(storage: &dyn PickyStorage, ca_name: &str) -> Result<Vec<String>, String> {
     let ca_hash = storage
         .get_addressing_hash_by_name(ca_name)
+        .await
         .map_err(|e| format!("couldn't fetch CA hash id for {}: {}", ca_name, e))?;
 
     let mut cert_der = storage
         .get_cert_by_addressing_hash(&ca_hash)
+        .await
         .map_err(|e| format!("couldn't fetch CA certificate der: {}", e))?;
     let mut chain = vec![to_pem("CERTIFICATE", &cert_der)];
     let mut current_key_id = String::default();
@@ -369,10 +381,12 @@ fn find_ca_chain(storage: &dyn PickyStorage, ca_name: &str) -> Result<Vec<String
 
         let hash_address = storage
             .get_addressing_hash_by_key_identifier(&parent_key_id)
+            .await
             .map_err(|e| format!("couldn't fetch hash: {}", e))?;
 
         cert_der = storage
             .get_cert_by_addressing_hash(&hash_address)
+            .await
             .map_err(|e| format!("couldn't fetch certificate der: {}", e))?;
 
         chain.push(to_pem("CERTIFICATE", &cert_der));
@@ -385,10 +399,10 @@ fn find_ca_chain(storage: &dyn PickyStorage, ca_name: &str) -> Result<Vec<String
 
 // === generate root CA === //
 
-fn generate_root_ca(config: &Config, storage: &dyn PickyStorage) -> Result<bool, String> {
+async fn generate_root_ca(config: &Config, storage: &dyn PickyStorage) -> Result<bool, String> {
     let name = format!("{} Root CA", config.realm);
 
-    if let Ok(certs) = storage.get_addressing_hash_by_name(&name) {
+    if let Ok(certs) = storage.get_addressing_hash_by_name(&name).await {
         if !certs.is_empty() {
             // already exists
             return Ok(false);
@@ -417,6 +431,7 @@ fn generate_root_ca(config: &Config, storage: &dyn PickyStorage) -> Result<bool,
             key_identifier: hex::encode(ski),
             key: Some(pk_pkcs8),
         })
+        .await
         .map_err(|e| format!("couldn't store generated root certificate: {}", e))?;
 
     Ok(true)
@@ -424,24 +439,26 @@ fn generate_root_ca(config: &Config, storage: &dyn PickyStorage) -> Result<bool,
 
 // === generate intermediate CA === //
 
-fn generate_intermediate_ca(config: &Config, storage: &dyn PickyStorage) -> Result<bool, String> {
+async fn generate_intermediate_ca(config: &Config, storage: &dyn PickyStorage) -> Result<bool, String> {
     let root_name = format!("{} Root CA", config.realm);
     let intermediate_name = format!("{} Authority", config.realm);
 
-    if let Ok(certs) = storage.get_addressing_hash_by_name(&intermediate_name) {
+    if let Ok(certs) = storage.get_addressing_hash_by_name(&intermediate_name).await {
         if !certs.is_empty() {
             // already exists
             return Ok(false);
         }
     }
 
-    let (root_cert_der, root_key_der) = match storage.get_addressing_hash_by_name(&root_name) {
+    let (root_cert_der, root_key_der) = match storage.get_addressing_hash_by_name(&root_name).await {
         Ok(root_hash) => (
             storage
                 .get_cert_by_addressing_hash(&root_hash)
+                .await
                 .map_err(|e| format!("couldn't fetch root CA: {}", e))?,
             storage
                 .get_key_by_addressing_hash(&root_hash)
+                .await
                 .map_err(|e| format!("couldn't fetch root CA private key: {}", e))?,
         ),
         Err(e) => {
@@ -481,6 +498,7 @@ fn generate_intermediate_ca(config: &Config, storage: &dyn PickyStorage) -> Resu
             key_identifier: hex::encode(ski),
             key: Some(pk_pkcs8),
         })
+        .await
         .map_err(|e| format!("couldn't store generated intermediate certificate: {}", e))?;
 
     Ok(true)
@@ -488,14 +506,16 @@ fn generate_intermediate_ca(config: &Config, storage: &dyn PickyStorage) -> Resu
 
 // === inject config provided certificates in picky storage === //
 
-fn inject_config_provided_cert(
+async fn inject_config_provided_cert(
     expected_subject_name: &str,
     cert_key_pair: &CertKeyPair,
     storage: &dyn PickyStorage,
 ) -> Result<(), String> {
     let (cert, cert_der) = match &cert_key_pair.cert {
         PathOr::Path(path) => {
-            let pem_str = std::fs::read_to_string(path).map_err(|e| format!("couldn't read cert: {}", e))?;
+            let pem_str = tokio::fs::read_to_string(path)
+                .await
+                .map_err(|e| format!("couldn't read cert: {}", e))?;
             let pem = pem_str
                 .parse::<Pem>()
                 .map_err(|e| format!("couldn't parse cert pem: {}", e))?;
@@ -529,7 +549,9 @@ fn inject_config_provided_cert(
 
     let key_der = match &cert_key_pair.key {
         PathOr::Path(path) => {
-            let pem_str = std::fs::read_to_string(path).map_err(|e| format!("couldn't read key: {}", e))?;
+            let pem_str = tokio::fs::read_to_string(path)
+                .await
+                .map_err(|e| format!("couldn't read key: {}", e))?;
             let pem = pem_str
                 .parse::<Pem>()
                 .map_err(|e| format!("couldn't parse key pem: {}", e))?;
@@ -547,6 +569,7 @@ fn inject_config_provided_cert(
             key_identifier: ski,
             key: Some(key_der),
         })
+        .await
         .map_err(|e| format!("couldn't store certificate: {}", e))?;
 
     Ok(())
@@ -555,7 +578,7 @@ fn inject_config_provided_cert(
 // === config management === //
 
 async fn reload_yaml_conf(controller: &ServerController, _: Request<Body>) -> (&'static str, StatusCode) {
-    match reload_yaml_conf_impl(controller) {
+    match reload_yaml_conf_impl(controller).await {
         Ok(()) => ("Config reloaded successfully!", StatusCode::OK),
         Err(e) => {
             log::error!("couldn't reload config: {}", e);
@@ -564,12 +587,12 @@ async fn reload_yaml_conf(controller: &ServerController, _: Request<Body>) -> (&
     }
 }
 
-fn reload_yaml_conf_impl(controller_data: &ServerController) -> Result<(), String> {
+async fn reload_yaml_conf_impl(controller_data: &ServerController) -> Result<(), String> {
     match Config::init_yaml() {
         Ok(new_conf) => {
             log::info!("new config: {:#?}", new_conf);
 
-            init_storage_from_config(controller_data.storage.as_ref(), &new_conf)?;
+            init_storage_from_config(controller_data.storage.as_ref(), &new_conf).await?;
 
             match build_logger_config(&new_conf) {
                 Ok(logger_config) => controller_data.log_handle.set_config(logger_config),
@@ -578,7 +601,7 @@ fn reload_yaml_conf_impl(controller_data: &ServerController) -> Result<(), Strin
                 }
             }
 
-            let mut old_conf = controller_data.write_conf();
+            let mut old_conf = controller_data.write_conf().await;
             if old_conf.database_url != new_conf.database_url {
                 log::warn!("'database_url' modification require service restart");
             }
@@ -597,17 +620,20 @@ fn reload_yaml_conf_impl(controller_data: &ServerController) -> Result<(), Strin
     }
 }
 
-fn init_storage_from_config(storage: &dyn PickyStorage, config: &Config) -> Result<(), String> {
+async fn init_storage_from_config(storage: &dyn PickyStorage, config: &Config) -> Result<(), String> {
     log::info!("init storage from config");
 
     if let Some(root_cert_key_pair) = &config.root {
         log::info!("inject root CA provided by settings");
-        if let Err(e) = inject_config_provided_cert(&format!("{} Root CA", config.realm), root_cert_key_pair, storage) {
+        let expected = format!("{} Root CA", config.realm);
+        if let Err(e) = inject_config_provided_cert(&expected, root_cert_key_pair, storage).await {
             return Err(format!("couldn't inject root CA: {}", e));
         }
     } else {
         log::info!("root CA...");
-        let created = generate_root_ca(&config, storage).map_err(|e| format!("couldn't generate root CA: {}", e))?;
+        let created = generate_root_ca(&config, storage)
+            .await
+            .map_err(|e| format!("couldn't generate root CA: {}", e))?;
         if created {
             log::info!("created");
         } else {
@@ -617,16 +643,14 @@ fn init_storage_from_config(storage: &dyn PickyStorage, config: &Config) -> Resu
 
     if let Some(intermediate_cert_key_pair) = &config.intermediate {
         log::info!("inject intermediate CA provided by settings");
-        if let Err(e) = inject_config_provided_cert(
-            &format!("{} Authority", config.realm),
-            intermediate_cert_key_pair,
-            storage,
-        ) {
+        let expected = format!("{} Authority", config.realm);
+        if let Err(e) = inject_config_provided_cert(&expected, intermediate_cert_key_pair, storage).await {
             return Err(format!("couldn't inject intermediate CA: {}", e));
         }
     } else {
         log::info!("intermediate CA...");
         let created = generate_intermediate_ca(&config, storage)
+            .await
             .map_err(|e| format!("couldn't generate intermediate CA: {}", e))?;
         if created {
             log::info!("created");
@@ -646,6 +670,7 @@ mod tests {
         signature::SignatureHashType,
         x509::{date::UTCDate, name::DirectoryName},
     };
+    use tokio_test::block_on;
 
     fn config() -> Config {
         let mut config = Config::default();
@@ -656,12 +681,12 @@ mod tests {
     #[test]
     fn generate_chain_and_verify() {
         let config = config();
-        let storage = get_storage(&config);
+        let storage = block_on(get_storage(&config));
 
         let ca_name = format!("{} Authority", config.realm);
 
-        generate_root_ca(&config, storage.as_ref()).expect("couldn't generate root ca");
-        generate_intermediate_ca(&config, storage.as_ref()).expect("couldn't generate intermediate ca");
+        block_on(generate_root_ca(&config, storage.as_ref())).expect("couldn't generate root ca");
+        block_on(generate_intermediate_ca(&config, storage.as_ref())).expect("couldn't generate intermediate ca");
 
         let pk = Picky::generate_private_key(2048).expect("couldn't generate private key");
         let csr = Csr::generate(
@@ -672,10 +697,10 @@ mod tests {
         .expect("couldn't generate csr");
 
         let signed_cert =
-            sign_certificate(&ca_name, csr, &config, storage.as_ref()).expect("couldn't sign certificate");
+            block_on(sign_certificate(&ca_name, csr, &config, storage.as_ref())).expect("couldn't sign certificate");
 
         let issuer_name = signed_cert.issuer_name().find_common_name().unwrap().to_string();
-        let chain_pem = find_ca_chain(storage.as_ref(), &issuer_name).expect("couldn't fetch CA chain");
+        let chain_pem = block_on(find_ca_chain(storage.as_ref(), &issuer_name)).expect("couldn't fetch CA chain");
 
         assert_eq!(chain_pem.len(), 2);
 
