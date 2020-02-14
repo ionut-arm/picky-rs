@@ -2163,9 +2163,9 @@ dependencies = [
 
 [[package]]
 name = "saphir"
-version = "2.0.0-alpha"
+version = "2.0.0-alpha2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a647655c6b503bd4c7fcd73011ce3fad4bca6201fbb7a6f2c847ea03f636eeab"
+checksum = "a14fefa803aa512c9ac6bafb6d6f33bbe9ce3cb4b5e15dc2557f7960c803f9dc"
 dependencies = [
  "futures 0.3.2",
  "futures-util",

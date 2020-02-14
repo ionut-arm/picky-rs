@@ -1,4 +1,7 @@
-use crate::{config::Config, http::controller::ServerController};
+use crate::{
+    config::Config,
+    http::{controller::ServerController, middleware},
+};
 use log4rs::Handle;
 use saphir::server::Server as SaphirServer;
 
@@ -16,6 +19,7 @@ impl HttpServer {
         let server = SaphirServer::builder()
             .configure_router(|r| r.controller(controller))
             .configure_listener(|l| l.interface("0.0.0.0:12345"))
+            .configure_middlewares(|m| m.apply(middleware::log_middleware, (), vec!["/"], None))
             .build();
 
         HttpServer { server }
